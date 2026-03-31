@@ -68,6 +68,18 @@ Once deployed, connect your gateway to an ElevenLabs Conversational AI agent:
 
 > Docs: [elevenlabs.io/docs/eleven-agents/customization/llm/custom-llm](https://elevenlabs.io/docs/eleven-agents/customization/llm/custom-llm)
 
+## Available Models
+
+| Model | Tier |
+| ----- | ---- |
+| `gemini-3.1-pro-preview` | Preview |
+| `gemini-3.1-flash-lite-preview` | Preview |
+| `gemini-2.5-pro` | Stable |
+| `gemini-2.5-flash` | Stable |
+| `gemini-2.5-flash-lite` | Stable |
+
+> Models are fetched dynamically from Vertex AI. The list above reflects currently available models via the `/v1/models` endpoint.
+
 ## Endpoints
 
 **Chat completions**
@@ -86,9 +98,6 @@ curl https://your-gateway.workers.dev/v1/models \
   -H "Authorization: Bearer YOUR_API_KEY"
 ```
 
-Supports: `model`, `messages`, `temperature`, `max_tokens`, `top_p`, `stream`, `tools`, `tool_choice`.
-
 ## License
 
 MIT
-# cloudflare-vertex-ai-gateway
