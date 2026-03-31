@@ -1,0 +1,16 @@
+{
+  "name": "vertex-ai-gateway",
+  "version": "1.0.0",
+  "description": "Open-source Cloudflare Worker: OpenAI-compatible proxy for Google Vertex AI. Use as Custom LLM endpoint for ElevenLabs or any OpenAI client.",
+  "license": "MIT",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260317.1",
+    "typescript": "^6.0.2",
+    "wrangler": "^4.78.0"
+  }
+}
