@@ -1,12 +1,41 @@
 import {
   Env, OpenAIChatRequest, OpenAIChatResponse, OpenAIMessage, OpenAIToolCall,
-  VertexRequest, VertexResponse, VertexPart,
+  ReasoningEffort, VertexRequest, VertexResponse, VertexPart,
 } from "./types";
 import { getGCPAccessToken } from "./auth";
 
 const MAX_STREAM_DURATION_MS = 120_000;
 const DEFAULT_MAX_TOKENS = 8192;
 const GOOGLE_MODEL_PREFIXES = ["gemini-", "gemma-"];
+
+// Map OpenAI reasoning_effort to Vertex thinkingConfig based on model version
+function mapReasoningEffort(
+  effort: ReasoningEffort, model: string
+): { thinkingBudget?: number; thinkingLevel?: string } {
+  const isGemini3 = model.startsWith("gemini-3");
+
+  if (isGemini3) {
+    // Gemini 3.x uses thinkingLevel
+    const levelMap: Record<ReasoningEffort, string> = {
+      none: "minimal",
+      minimal: "minimal",
+      low: "low",
+      medium: "medium",
+      high: "high",
+    };
+    return { thinkingLevel: levelMap[effort] };
+  }
+
+  // Gemini 2.5 uses thinkingBudget (integer)
+  const budgetMap: Record<ReasoningEffort, number> = {
+    none: 0,
+    minimal: 128,
+    low: 1024,
+    medium: 8192,
+    high: -1,
+  };
+  return { thinkingBudget: budgetMap[effort] };
+}
 
 function isGeminiModel(model: string): boolean {
   return GOOGLE_MODEL_PREFIXES.some((p) => model.startsWith(p));
@@ -24,11 +53,11 @@ function errorResponse(status: number, message: string): Response {
 }
 
 export async function handleChatCompletions(
-  request: Request, env: Env, ctx: ExecutionContext
+  request: Request, env: Env
 ): Promise<Response> {
   let body: OpenAIChatRequest;
   try {
-    body = await request.json();
+    body = await request.json() as OpenAIChatRequest;
   } catch {
     return errorResponse(400, "Invalid JSON body.");
   }
@@ -65,6 +94,7 @@ export async function handleChatCompletions(
       ...(body.stream !== undefined && { stream: body.stream }),
       ...(body.tools && { tools: body.tools }),
       ...(body.tool_choice !== undefined && { tool_choice: body.tool_choice }),
+      ...(body.reasoning_effort !== undefined && { reasoning_effort: body.reasoning_effort }),
     });
   }
 
@@ -88,11 +118,11 @@ export async function handleChatCompletions(
 
   if (isGoogle) {
     if (body.stream) return handleGeminiStream(response, model);
-    const vertexData: VertexResponse = await response.json();
+    const vertexData = await response.json() as VertexResponse;
     return json(vertexToOpenai(vertexData, model));
   } else {
     if (body.stream) return passthroughStream(response);
-    const data: OpenAIChatResponse = await response.json();
+    const data = await response.json() as OpenAIChatResponse;
     return json(data);
   }
 }
@@ -141,11 +171,14 @@ function openaiToVertex(body: OpenAIChatRequest): VertexRequest {
     }
   }
 
-  if (body.temperature !== undefined || body.max_tokens !== undefined || body.top_p !== undefined) {
+  if (body.temperature !== undefined || body.max_tokens !== undefined || body.top_p !== undefined || body.reasoning_effort !== undefined) {
     result.generationConfig = {};
     if (body.temperature !== undefined) result.generationConfig.temperature = body.temperature;
     if (body.max_tokens !== undefined) result.generationConfig.maxOutputTokens = body.max_tokens;
     if (body.top_p !== undefined) result.generationConfig.topP = body.top_p;
+    if (body.reasoning_effort !== undefined) {
+      result.generationConfig.thinkingConfig = mapReasoningEffort(body.reasoning_effort, body.model || "gemini-2.0-flash");
+    }
   }
 
   if (body.tools && body.tools.length > 0) {

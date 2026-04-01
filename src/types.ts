@@ -35,6 +35,8 @@ export interface OpenAIMessage {
   name?: string;
 }
 
+export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high";
+
 export interface OpenAIChatRequest {
   model?: string;
   messages: OpenAIMessage[];
@@ -44,6 +46,7 @@ export interface OpenAIChatRequest {
   stream?: boolean;
   tools?: OpenAITool[];
   tool_choice?: "auto" | "none" | "required" | { type: "function"; function: { name: string } };
+  reasoning_effort?: ReasoningEffort;
 }
 
 export interface OpenAIChatResponse {
@@ -92,6 +95,10 @@ export interface VertexRequest {
     temperature?: number;
     maxOutputTokens?: number;
     topP?: number;
+    thinkingConfig?: {
+      thinkingBudget?: number;
+      thinkingLevel?: string;
+    };
   };
   tools?: Array<{
     functionDeclarations: Array<{
