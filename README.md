@@ -1,18 +1,19 @@
 # Vertex AI Gateway
 
-Cloudflare Worker that converts OpenAI API format to Google Vertex AI. Use it as **Custom LLM** in ElevenLabs or any OpenAI-compatible client.
+OpenAI-compatible proxy for Google Vertex AI. Deploy to **Cloudflare Workers** or **Google Cloud Run**. Use it as **Custom LLM** in ElevenLabs or any OpenAI-compatible client.
 
 ```
-Your app ──(OpenAI format)──> Cloudflare Worker ──(Vertex format)──> Google Vertex AI
+Your app ──(OpenAI format)──> Gateway ──(Vertex format)──> Google Vertex AI
 ```
 
 ## Prerequisites
 
-- [Cloudflare account](https://dash.cloudflare.com/sign-up)
 - [Google Cloud project](https://console.cloud.google.com) with Vertex AI API enabled
 - GCP service account JSON key with Vertex AI permissions
+- **For Cloudflare**: [Cloudflare account](https://dash.cloudflare.com/sign-up)
+- **For Cloud Run**: [gcloud CLI](https://cloud.google.com/sdk/docs/install) installed and authenticated
 
-## Deploy
+## Deploy to Cloudflare Workers
 
 ```bash
 # 1. Install
@@ -35,11 +36,78 @@ npm run deploy
 
 Done. You'll get a URL like `https://vertex-ai-gateway.<your-subdomain>.workers.dev`.
 
+## Deploy to Google Cloud Run
+
+### Prerequisites
+
+1. [gcloud CLI](https://cloud.google.com/sdk/docs/install) installed
+2. A GCP project with the following APIs enabled (they will be enabled automatically on first deploy):
+   - Cloud Run API
+   - Cloud Build API
+   - Artifact Registry API
+3. The default Compute Engine service account (`PROJECT_NUMBER-compute@developer.gserviceaccount.com`) needs these roles:
+   - **Storage Admin** (`roles/storage.admin`)
+   - **Cloud Build Service Account** (`roles/cloudbuild.builds.builder`)
+
+   You can grant them with:
+   ```bash
+   gcloud projects add-iam-policy-binding YOUR_GCP_PROJECT_ID \
+     --member="serviceAccount:PROJECT_NUMBER-compute@developer.gserviceaccount.com" \
+     --role="roles/storage.admin"
+
+   gcloud projects add-iam-policy-binding YOUR_GCP_PROJECT_ID \
+     --member="serviceAccount:PROJECT_NUMBER-compute@developer.gserviceaccount.com" \
+     --role="roles/cloudbuild.builds.builder"
+   ```
+
+### Deploy
+
+```bash
+# 1. Login and set project
+gcloud auth login
+gcloud config set project YOUR_GCP_PROJECT_ID
+
+# 2. Create an env.yaml file with your environment variables
+cat > env.yaml <<'EOF'
+VERTEX_PROJECT_ID: "your-vertex-project-id"
+VERTEX_REGION: "us-central1"
+API_KEY: "sk_your-uuid-here"
+VERTEX_SERVICE_ACCOUNT_JSON: |
+  {"type":"service_account","project_id":"...","private_key":"...","client_email":"..."}
+EOF
+
+# 3. Deploy (builds with Dockerfile automatically)
+gcloud run deploy vertex-ai-gateway \
+  --source . \
+  --region us-central1 \
+  --env-vars-file env.yaml \
+  --allow-unauthenticated
+
+# 4. Clean up the env file (contains secrets)
+rm env.yaml
+```
+
+Done. You'll get a URL like `https://vertex-ai-gateway-XXXXXX.us-central1.run.app`.
+
+> **Note**: The `--env-vars-file` approach is recommended because the service account JSON contains special characters that break `--set-env-vars`. For production, use [Secret Manager](https://cloud.google.com/run/docs/configuring/services/secrets) instead for sensitive values.
+
 ## Local dev
+
+**With Wrangler (Cloudflare runtime):**
 
 ```bash
 cp .dev.vars.example .dev.vars  # fill in your values
 npm run dev
+```
+
+**With Node.js:**
+
+```bash
+export VERTEX_PROJECT_ID=your-project-id
+export VERTEX_REGION=global
+export VERTEX_SERVICE_ACCOUNT_JSON='{"type":"service_account",...}'
+export API_KEY=your-api-key
+npm run build:cloudrun && npm start
 ```
 
 ## Environment variables
@@ -49,7 +117,7 @@ npm run dev
 | `VERTEX_PROJECT_ID`           | GCP project ID                                             |
 | `VERTEX_REGION`               | `global`, `us-central1`, etc.                              |
 | `VERTEX_SERVICE_ACCOUNT_JSON` | Full JSON key from GCP service account in one line         |
-| `API_KEY`                     | Any string you choose. Clients send this as `Bearer` token |
+| `API_KEY`                     | Must follow OpenAI key format: `sk_<uuid>` (e.g. `sk_58aadc9c-b687-41ea-8d20-e6eccd58c0de`). Clients send this as `Bearer` token |
 
 ## Use with ElevenLabs
 
@@ -59,7 +127,7 @@ Once deployed, connect your gateway to an ElevenLabs Conversational AI agent:
 2. In the agent settings, click the **LLM** dropdown on the right side
 3. Scroll down and select **Custom LLM**
 4. Fill in:
-   - **Server URL**: `https://your-gateway.workers.dev/v1`
+   - **Server URL**: `https://your-gateway-url/v1` (your Workers or Cloud Run URL)
    - **Model ID**: `gemini-2.5-flash` (or any model from your Vertex project)
 5. Under **API key**, click the dropdown and select **Create new secret**
    - Name: `OPENAI_API_KEY`
@@ -85,7 +153,7 @@ Once deployed, connect your gateway to an ElevenLabs Conversational AI agent:
 **Chat completions**
 
 ```bash
-curl https://your-gateway.workers.dev/v1/chat/completions \
+curl https://your-gateway-url/v1/chat/completions \
   -H "Authorization: Bearer YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"Hello"}]}'
@@ -94,7 +162,7 @@ curl https://your-gateway.workers.dev/v1/chat/completions \
 **List models**
 
 ```bash
-curl https://your-gateway.workers.dev/v1/models \
+curl https://your-gateway-url/v1/models \
   -H "Authorization: Bearer YOUR_API_KEY"
 ```
 

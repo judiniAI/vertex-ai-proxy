@@ -78,7 +78,7 @@ export async function getGCPAccessToken(
     throw new Error(`GCP token exchange failed: ${err}`);
   }
 
-  const data: { access_token: string } = await response.json();
+  const data = await response.json() as { access_token: string };
   cachedToken = { token: data.access_token, expiresAt: now + 3500 };
   return data.access_token;
 }
