@@ -9,7 +9,7 @@ const DEFAULT_MAX_TOKENS = 8192;
 const GOOGLE_MODEL_PREFIXES = ["gemini-", "gemma-"];
 
 // Map OpenAI reasoning_effort to Vertex thinkingConfig based on model version
-function mapReasoningEffort(
+export function mapReasoningEffort(
   effort: ReasoningEffort, model: string
 ): { thinkingBudget?: number; thinkingLevel?: string } {
   const isGemini3 = model.startsWith("gemini-3");
@@ -129,7 +129,7 @@ export async function handleChatCompletions(
 
 // --- OpenAI <-> Vertex format conversion ---
 
-function openaiToVertex(body: OpenAIChatRequest): VertexRequest {
+export function openaiToVertex(body: OpenAIChatRequest): VertexRequest {
   const result: VertexRequest = { contents: [] };
 
   const systemMessages = body.messages.filter((m) => m.role === "system");
