@@ -71,7 +71,7 @@ export async function handleChatCompletions(
 
   const isGoogle = isGeminiModel(model);
   const token = await getGCPAccessToken(env.VERTEX_SERVICE_ACCOUNT_JSON);
-  const region = env.VERTEX_REGION || "us-central1";
+  const region = env.VERTEX_REGION || "global";
   const host = region === "global"
     ? "aiplatform.googleapis.com"
     : `${region}-aiplatform.googleapis.com`;
