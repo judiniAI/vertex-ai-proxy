@@ -8,6 +8,76 @@ const MAX_STREAM_DURATION_MS = 120_000;
 const DEFAULT_MAX_TOKENS = 8192;
 const GOOGLE_MODEL_PREFIXES = ["gemini-", "gemma-"];
 
+// Keys not supported by Vertex AI schemas (OpenAPI 3.0 subset)
+const UNSUPPORTED_SCHEMA_KEYS = new Set([
+  "additionalProperties", "default", "title", "$ref",
+  "oneOf", "anyOf", "allOf", "$schema", "$id",
+]);
+
+/** Strip unsupported schema properties and normalize types for Vertex AI */
+export function sanitizeSchema(schema: Record<string, unknown>): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+
+  for (const [key, value] of Object.entries(schema)) {
+    if (UNSUPPORTED_SCHEMA_KEYS.has(key)) continue;
+
+    if (key === "type") {
+      // Handle ["string", "null"] → "STRING" + nullable
+      if (Array.isArray(value)) {
+        const types = (value as string[]).filter((t) => t !== "null");
+        result.type = (types[0] || "string").toUpperCase();
+        if ((value as string[]).includes("null")) result.nullable = true;
+      } else if (typeof value === "string") {
+        result.type = value.toUpperCase();
+      } else {
+        result.type = value;
+      }
+      continue;
+    }
+
+    if (key === "properties" && typeof value === "object" && value !== null) {
+      const props: Record<string, unknown> = {};
+      for (const [pk, pv] of Object.entries(value as Record<string, unknown>)) {
+        if (typeof pv === "object" && pv !== null) {
+          props[pk] = sanitizeSchema(pv as Record<string, unknown>);
+        } else {
+          props[pk] = pv;
+        }
+      }
+      result.properties = props;
+      continue;
+    }
+
+    if (key === "items" && typeof value === "object" && value !== null) {
+      result.items = sanitizeSchema(value as Record<string, unknown>);
+      continue;
+    }
+
+    result[key] = value;
+  }
+
+  return result;
+}
+
+/** Ensure functionResponse.response is always a JSON object (protobuf Struct) */
+export function ensureResponseObject(data: unknown): Record<string, unknown> {
+  if (typeof data === "object" && data !== null && !Array.isArray(data)) {
+    return data as Record<string, unknown>;
+  }
+  return { result: data };
+}
+
+/** Resolve Vertex AI region: header > env > model-based default */
+export function resolveRegion(request: Request, env: Env, model: string): string {
+  const headerRegion = request.headers.get("x-vertex-region");
+  if (headerRegion) return headerRegion;
+  if (env.VERTEX_REGION) return env.VERTEX_REGION;
+  // Gemini 3.x+ works on global, 2.5 needs a regional endpoint
+  if (model.startsWith("gemini-3")) return "global";
+  if (model.startsWith("gemini-2.5")) return "us-east1";
+  return "global";
+}
+
 // Map OpenAI reasoning_effort to Vertex thinkingConfig based on model version
 export function mapReasoningEffort(
   effort: ReasoningEffort, model: string
@@ -16,9 +86,11 @@ export function mapReasoningEffort(
 
   if (isGemini3) {
     // Gemini 3.x uses thinkingLevel
+    // 3.1-pro-preview does not support "minimal", min is "low"
+    const isProModel = model.includes("pro");
     const levelMap: Record<ReasoningEffort, string> = {
-      none: "minimal",
-      minimal: "minimal",
+      none: isProModel ? "low" : "minimal",
+      minimal: isProModel ? "low" : "minimal",
       low: "low",
       medium: "medium",
       high: "high",
@@ -27,9 +99,15 @@ export function mapReasoningEffort(
   }
 
   // Gemini 2.5 uses thinkingBudget (integer)
+  // Pro: always on, min 128, max 32768
+  // Flash: can disable, min 1, max 24576
+  // Flash-Lite: can disable, min 512 when on, max 24576
+  const isProModel = model.includes("2.5-pro");
+  const isLiteModel = model.includes("flash-lite");
+
   const budgetMap: Record<ReasoningEffort, number> = {
-    none: 0,
-    minimal: 128,
+    none: isProModel ? 128 : 0,
+    minimal: isLiteModel ? 512 : 128,
     low: 1024,
     medium: 8192,
     high: -1,
@@ -66,12 +144,29 @@ export async function handleChatCompletions(
     return errorResponse(400, "messages array is required and must not be empty.");
   }
 
+  // Validate tool response count matches previous function calls
+  for (let i = 1; i < body.messages.length; i++) {
+    if (body.messages[i].role === "tool") {
+      // Find the preceding assistant message with tool_calls
+      let assistantIdx = i - 1;
+      while (assistantIdx >= 0 && body.messages[assistantIdx].role === "tool") assistantIdx--;
+      if (assistantIdx >= 0 && body.messages[assistantIdx].role === "assistant" && body.messages[assistantIdx].tool_calls) {
+        const expectedCount = body.messages[assistantIdx].tool_calls!.length;
+        let toolCount = 0;
+        for (let j = assistantIdx + 1; j < body.messages.length && body.messages[j].role === "tool"; j++) toolCount++;
+        if (toolCount !== expectedCount) {
+          return errorResponse(400, `Tool response count (${toolCount}) does not match function call count (${expectedCount}). Vertex AI requires an exact match.`);
+        }
+      }
+    }
+  }
+
   const model = body.model || "gemini-2.0-flash";
   body.max_tokens = Math.min(body.max_tokens ?? DEFAULT_MAX_TOKENS, DEFAULT_MAX_TOKENS);
 
   const isGoogle = isGeminiModel(model);
   const token = await getGCPAccessToken(env.VERTEX_SERVICE_ACCOUNT_JSON);
-  const region = env.VERTEX_REGION || "global";
+  const region = resolveRegion(request, env, model);
   const host = region === "global"
     ? "aiplatform.googleapis.com"
     : `${region}-aiplatform.googleapis.com`;
@@ -88,13 +183,13 @@ export async function handleChatCompletions(
     requestBody = JSON.stringify({
       model,
       messages: body.messages,
-      ...(body.temperature !== undefined && { temperature: body.temperature }),
-      ...(body.max_tokens !== undefined && { max_tokens: body.max_tokens }),
-      ...(body.top_p !== undefined && { top_p: body.top_p }),
-      ...(body.stream !== undefined && { stream: body.stream }),
+      ...(body.temperature != null && { temperature: body.temperature }),
+      ...(body.max_tokens != null && { max_tokens: body.max_tokens }),
+      ...(body.top_p != null && { top_p: body.top_p }),
+      ...(body.stream != null && { stream: body.stream }),
       ...(body.tools && { tools: body.tools }),
-      ...(body.tool_choice !== undefined && { tool_choice: body.tool_choice }),
-      ...(body.reasoning_effort !== undefined && { reasoning_effort: body.reasoning_effort }),
+      ...(body.tool_choice != null && { tool_choice: body.tool_choice }),
+      ...(body.reasoning_effort != null && { reasoning_effort: body.reasoning_effort }),
     });
   }
 
@@ -155,8 +250,9 @@ export function openaiToVertex(body: OpenAIChatRequest): VertexRequest {
       }
       if (msg.content) parts.unshift({ text: msg.content });
     } else if (msg.role === "tool") {
-      let responseData: Record<string, unknown>;
-      try { responseData = JSON.parse(msg.content || "{}"); } catch { responseData = { output: msg.content || "" }; }
+      let parsed: unknown;
+      try { parsed = JSON.parse(msg.content || "{}"); } catch { parsed = { output: msg.content || "" }; }
+      const responseData = ensureResponseObject(parsed);
       parts.push({ functionResponse: { name: msg.name || msg.tool_call_id || "unknown", response: responseData } });
     } else {
       parts.push({ text: msg.content || "" });
@@ -171,27 +267,34 @@ export function openaiToVertex(body: OpenAIChatRequest): VertexRequest {
     }
   }
 
-  if (body.temperature !== undefined || body.max_tokens !== undefined || body.top_p !== undefined || body.reasoning_effort !== undefined) {
+  if (body.temperature != null || body.max_tokens != null || body.top_p != null || body.reasoning_effort != null) {
     result.generationConfig = {};
-    if (body.temperature !== undefined) result.generationConfig.temperature = body.temperature;
-    if (body.max_tokens !== undefined) result.generationConfig.maxOutputTokens = body.max_tokens;
-    if (body.top_p !== undefined) result.generationConfig.topP = body.top_p;
-    if (body.reasoning_effort !== undefined) {
+    if (body.temperature != null) result.generationConfig.temperature = body.temperature;
+    if (body.max_tokens != null) result.generationConfig.maxOutputTokens = body.max_tokens;
+    if (body.top_p != null) result.generationConfig.topP = body.top_p;
+    if (body.reasoning_effort != null) {
       result.generationConfig.thinkingConfig = mapReasoningEffort(body.reasoning_effort, body.model || "gemini-2.0-flash");
     }
   }
 
   if (body.tools && body.tools.length > 0) {
     result.tools = [{
-      functionDeclarations: body.tools.map((t) => ({
-        name: t.function.name,
-        description: t.function.description,
-        parameters: t.function.parameters,
-      })),
+      functionDeclarations: body.tools.map((t) => {
+        const decl: { name: string; description?: string; parameters?: Record<string, unknown> } = {
+          name: t.function.name,
+          description: t.function.description,
+        };
+        if (t.function.parameters && Object.keys(t.function.parameters).length > 0) {
+          const sanitized = sanitizeSchema(t.function.parameters);
+          if (!sanitized.type) sanitized.type = "OBJECT";
+          decl.parameters = sanitized;
+        }
+        return decl;
+      }),
     }];
   }
 
-  if (body.tool_choice !== undefined && body.tools && body.tools.length > 0) {
+  if (body.tool_choice != null && body.tools && body.tools.length > 0) {
     if (body.tool_choice === "auto") {
       result.toolConfig = { functionCallingConfig: { mode: "AUTO" } };
     } else if (body.tool_choice === "none") {
