@@ -8,6 +8,28 @@ const MAX_STREAM_DURATION_MS = 120_000;
 const DEFAULT_MAX_TOKENS = 8192;
 const GOOGLE_MODEL_PREFIXES = ["gemini-", "gemma-"];
 
+// Retry + multi-region fallback for Gemini on DSQ 429.
+// Order reflects observed DSQ headroom from scripts/stress-regions.mjs:
+// `global` handles 100 concurrent with ~2% 429; regionals drop to 50-93%.
+// us-east5 and us-south1 ranked as best regional fallbacks.
+export const GEMINI_FALLBACK_REGIONS = [
+  "global",
+  "us-east5",
+  "us-south1",
+  "us-east1",
+  "us-central1",
+  "us-east4",
+  "us-west1",
+  "us-west4",
+] as const;
+
+const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
+const MAX_ATTEMPTS_PER_REGION = 2;
+const INITIAL_BACKOFF_MS = 250;
+const MAX_BACKOFF_MS = 2000;
+const OVERALL_BUDGET_MS = 25_000;
+const LONG_RETRY_THRESHOLD_SEC = 5;
+
 // Keys not supported by Vertex AI schemas (OpenAPI 3.0 subset)
 const UNSUPPORTED_SCHEMA_KEYS = new Set([
   "additionalProperties", "default", "title", "$ref",
@@ -119,6 +141,205 @@ function isGeminiModel(model: string): boolean {
   return GOOGLE_MODEL_PREFIXES.some((p) => model.startsWith(p));
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/** Full-jitter exponential backoff (AWS-style). */
+export function jitteredBackoffMs(attempt: number): number {
+  const cap = Math.min(MAX_BACKOFF_MS, INITIAL_BACKOFF_MS * Math.pow(2, attempt));
+  return Math.random() * cap;
+}
+
+/**
+ * Parse google.rpc.RetryInfo.retryDelay from a Vertex error body.
+ * Vertex does NOT set an HTTP Retry-After header; the hint lives in the
+ * error payload under details[].retryDelay as a duration string like "53s".
+ * Returns delay in seconds, or null if absent/unparseable.
+ */
+export function parseRetryInfoSeconds(bodyText: string): number | null {
+  try {
+    const parsed = JSON.parse(bodyText);
+    const errObj = Array.isArray(parsed) ? parsed[0]?.error : parsed?.error;
+    const details = errObj?.details;
+    if (!Array.isArray(details)) return null;
+    for (const d of details) {
+      const type = d?.["@type"];
+      if (typeof type === "string" && type.includes("RetryInfo") && typeof d.retryDelay === "string") {
+        const match = d.retryDelay.match(/^(\d+(?:\.\d+)?)s$/);
+        if (match) return parseFloat(match[1]);
+      }
+    }
+  } catch {
+    /* non-JSON body — nothing to parse */
+  }
+  return null;
+}
+
+/**
+ * Build the ordered region chain: primary first, then every fallback region
+ * in DSQ-headroom order (deduped). When respectExplicitRegion is true, returns
+ * only the primary — caller opted out of fallback via header.
+ */
+export function buildRegionChain(
+  primaryRegion: string,
+  respectExplicitRegion: boolean
+): string[] {
+  if (respectExplicitRegion) return [primaryRegion];
+  const chain = [primaryRegion];
+  for (const r of GEMINI_FALLBACK_REGIONS) {
+    if (r !== primaryRegion) chain.push(r);
+  }
+  return chain;
+}
+
+function buildGeminiUrl(
+  projectId: string,
+  region: string,
+  model: string,
+  stream: boolean
+): string {
+  const host =
+    region === "global"
+      ? "aiplatform.googleapis.com"
+      : `${region}-aiplatform.googleapis.com`;
+  const action = stream ? "streamGenerateContent?alt=sse" : "generateContent";
+  return `https://${host}/v1/projects/${projectId}/locations/${region}/publishers/google/models/${model}:${action}`;
+}
+
+export interface FallbackResult {
+  response: Response;
+  regionUsed: string;
+  attemptLog: string[];
+  succeeded: boolean;
+}
+
+/**
+ * Execute a Gemini request with per-region retry and cross-region fallback.
+ * Contract:
+ *   - Retries 408/429/5xx within a region up to MAX_ATTEMPTS_PER_REGION times.
+ *   - Honors google.rpc.RetryInfo.retryDelay if ≤ LONG_RETRY_THRESHOLD_SEC;
+ *     if server asks for a longer wait, skip straight to the next region.
+ *   - Non-retryable errors (4xx except 408/429) are propagated immediately.
+ *   - Wall-clock budget OVERALL_BUDGET_MS bounds the whole chain.
+ *   - Successful responses are returned untouched so streaming works.
+ *   - Error responses are returned with their ACTUAL status (not masked as 502)
+ *     so callers can implement their own retry logic on the outer layer.
+ */
+export async function fetchGeminiWithFallback(
+  opts: {
+    projectId: string;
+    model: string;
+    token: string;
+    requestBody: string;
+    primaryRegion: string;
+    stream: boolean;
+    respectExplicitRegion: boolean;
+  },
+  fetchImpl: typeof fetch = fetch
+): Promise<FallbackResult> {
+  const startedAt = Date.now();
+  const attemptLog: string[] = [];
+  const regions = buildRegionChain(opts.primaryRegion, opts.respectExplicitRegion);
+
+  let lastErrorBody: string | null = null;
+  let lastErrorStatus = 0;
+  let lastErrorHeaders: HeadersInit | undefined;
+
+  outer: for (const region of regions) {
+    if (Date.now() - startedAt > OVERALL_BUDGET_MS) {
+      attemptLog.push(`${region}:budget-exhausted`);
+      break;
+    }
+
+    const url = buildGeminiUrl(opts.projectId, region, opts.model, opts.stream);
+
+    for (let attempt = 0; attempt < MAX_ATTEMPTS_PER_REGION; attempt++) {
+      if (Date.now() - startedAt > OVERALL_BUDGET_MS) {
+        attemptLog.push(`${region}#${attempt}:budget-exhausted`);
+        break outer;
+      }
+
+      if (attempt > 0) {
+        await sleep(jitteredBackoffMs(attempt - 1));
+      }
+
+      let response: Response;
+      try {
+        response = await fetchImpl(url, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${opts.token}`,
+            "Content-Type": "application/json",
+          },
+          body: opts.requestBody,
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        attemptLog.push(`${region}#${attempt}:network:${msg}`);
+        // Treat network failure as retryable — fall through to next attempt
+        continue;
+      }
+
+      if (response.ok) {
+        attemptLog.push(`${region}#${attempt}:ok`);
+        return { response, regionUsed: region, attemptLog, succeeded: true };
+      }
+
+      // Non-success: read body once so we can decide retry vs propagate
+      const bodyText = await response.text();
+      lastErrorBody = bodyText;
+      lastErrorStatus = response.status;
+      lastErrorHeaders = { "Content-Type": response.headers.get("content-type") ?? "application/json" };
+      attemptLog.push(`${region}#${attempt}:${response.status}`);
+
+      // Non-retryable: fail fast, propagate real status
+      if (!RETRYABLE_STATUS.has(response.status)) {
+        return {
+          response: new Response(bodyText, {
+            status: response.status,
+            headers: lastErrorHeaders,
+          }),
+          regionUsed: region,
+          attemptLog,
+          succeeded: false,
+        };
+      }
+
+      // Retryable: honor RetryInfo if present
+      const retryAfterSec = parseRetryInfoSeconds(bodyText);
+      if (retryAfterSec !== null && retryAfterSec > LONG_RETRY_THRESHOLD_SEC) {
+        attemptLog.push(`${region}:retryAfter=${retryAfterSec}s,skip-region`);
+        continue outer;
+      }
+      if (retryAfterSec !== null && retryAfterSec > 0) {
+        await sleep(retryAfterSec * 1000);
+      }
+      // else: fall through to next attempt in this region
+    }
+  }
+
+  // All regions exhausted — synthesize final error response with real status
+  const finalStatus = lastErrorStatus || 502;
+  const finalBody =
+    lastErrorBody ??
+    JSON.stringify({
+      error: {
+        message: "All Vertex AI regions failed or exceeded wall-clock budget.",
+        type: "error",
+      },
+    });
+  return {
+    response: new Response(finalBody, {
+      status: finalStatus,
+      headers: lastErrorHeaders ?? { "Content-Type": "application/json" },
+    }),
+    regionUsed: "none",
+    attemptLog,
+    succeeded: false,
+  };
+}
+
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
     status,
@@ -167,20 +388,36 @@ export async function handleChatCompletions(
   const isGoogle = isGeminiModel(model);
   const token = await getGCPAccessToken(env.VERTEX_SERVICE_ACCOUNT_JSON);
   const region = resolveRegion(request, env, model);
-  const host = region === "global"
-    ? "aiplatform.googleapis.com"
-    : `${region}-aiplatform.googleapis.com`;
+  const hasExplicitRegionHeader = request.headers.get("x-vertex-region") != null;
 
-  let url: string;
-  let requestBody: string;
+  let response: Response;
+  let regionUsed = region;
+  let attemptLog: string[] = [];
 
   if (isGoogle) {
-    const action = body.stream ? "streamGenerateContent?alt=sse" : "generateContent";
-    url = `https://${host}/v1/projects/${env.VERTEX_PROJECT_ID}/locations/${region}/publishers/google/models/${model}:${action}`;
-    requestBody = JSON.stringify(openaiToVertex(body));
+    const requestBody = JSON.stringify(openaiToVertex(body));
+    const result = await fetchGeminiWithFallback({
+      projectId: env.VERTEX_PROJECT_ID,
+      model,
+      token,
+      requestBody,
+      primaryRegion: region,
+      stream: !!body.stream,
+      // Respect explicit region pin — no fallback when caller specified region
+      respectExplicitRegion: hasExplicitRegionHeader,
+    });
+    response = result.response;
+    regionUsed = result.regionUsed;
+    attemptLog = result.attemptLog;
   } else {
-    url = `https://${host}/v1/projects/${env.VERTEX_PROJECT_ID}/locations/${region}/endpoints/openapi/chat/completions`;
-    requestBody = JSON.stringify({
+    // Non-Gemini models (Claude, Llama, etc.) use a different endpoint shape
+    // that isn't supported in every region. Keep the single-shot path for them.
+    const host =
+      region === "global"
+        ? "aiplatform.googleapis.com"
+        : `${region}-aiplatform.googleapis.com`;
+    const url = `https://${host}/v1/projects/${env.VERTEX_PROJECT_ID}/locations/${region}/endpoints/openapi/chat/completions`;
+    const requestBody = JSON.stringify({
       model,
       messages: body.messages,
       ...(body.temperature != null && { temperature: body.temperature }),
@@ -191,13 +428,12 @@ export async function handleChatCompletions(
       ...(body.tool_choice != null && { tool_choice: body.tool_choice }),
       ...(body.reasoning_effort != null && { reasoning_effort: body.reasoning_effort }),
     });
+    response = await fetch(url, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: requestBody,
+    });
   }
-
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-    body: requestBody,
-  });
 
   if (!response.ok) {
     const upstreamBody = await response.text();
@@ -208,18 +444,46 @@ export async function handleChatCompletions(
     } catch {
       detail = upstreamBody.slice(0, 500);
     }
-    return errorResponse(502, `Upstream error ${response.status}: ${detail}`);
+    // Propagate the real upstream status (429/503/etc) so clients can do
+    // their own outer retry. Include attempt log for observability.
+    return json(
+      {
+        error: {
+          message: `Upstream error ${response.status}: ${detail}`,
+          type: "error",
+          regions_tried: attemptLog.length > 0 ? attemptLog : undefined,
+        },
+      },
+      response.status
+    );
   }
 
+  const successHeaders: Record<string, string> = { "X-Vertex-Region-Used": regionUsed };
+
   if (isGoogle) {
-    if (body.stream) return handleGeminiStream(response, model);
-    const vertexData = await response.json() as VertexResponse;
-    return json(vertexToOpenai(vertexData, model));
+    if (body.stream) return handleGeminiStream(response, model, successHeaders);
+    const vertexData = (await response.json()) as VertexResponse;
+    return jsonWithHeaders(vertexToOpenai(vertexData, model), 200, successHeaders);
   } else {
     if (body.stream) return passthroughStream(response);
-    const data = await response.json() as OpenAIChatResponse;
+    const data = (await response.json()) as OpenAIChatResponse;
     return json(data);
   }
+}
+
+function jsonWithHeaders(
+  data: unknown,
+  status: number,
+  extraHeaders: Record<string, string>
+): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+      ...extraHeaders,
+    },
+  });
 }
 
 // --- OpenAI <-> Vertex format conversion ---
@@ -347,7 +611,11 @@ function vertexToOpenai(data: VertexResponse, model: string): OpenAIChatResponse
 
 // --- Streaming ---
 
-function handleGeminiStream(response: Response, model: string): Response {
+function handleGeminiStream(
+  response: Response,
+  model: string,
+  extraHeaders: Record<string, string> = {}
+): Response {
   const id = `chatcmpl-${crypto.randomUUID()}`;
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
@@ -418,7 +686,13 @@ function handleGeminiStream(response: Response, model: string): Response {
   });
 
   return new Response(stream, {
-    headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive", "Access-Control-Allow-Origin": "*" },
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      "Access-Control-Allow-Origin": "*",
+      ...extraHeaders,
+    },
   });
 }
 
