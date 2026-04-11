@@ -9,18 +9,23 @@ const DEFAULT_MAX_TOKENS = 8192;
 const GOOGLE_MODEL_PREFIXES = ["gemini-", "gemma-"];
 
 // Retry + multi-region fallback for Gemini on DSQ 429.
-// Order reflects observed DSQ headroom from scripts/stress-regions.mjs:
-// `global` handles 100 concurrent with ~2% 429; regionals drop to 50-93%.
-// us-east5 and us-south1 ranked as best regional fallbacks.
+// Order ranked by average error rate across three empirical stress runs
+// (burst 30 / 100 / 600) from scripts/stress-regions.mjs. Lower is better:
+//   global      2.57%   us-east5   67.83%   us-south1  76.17%
+//   us-west4   88.90%   us-east1   89.67%   us-east4   90.27%
+//   us-west1   91.23%   us-central1 93.00%
+// Top 3 positions are stable across runs; positions 4-8 fluctuate under
+// extreme load, but the overall ring guarantees we exhaust the
+// high-headroom regions first before touching the weak ones.
 export const GEMINI_FALLBACK_REGIONS = [
   "global",
   "us-east5",
   "us-south1",
+  "us-west4",
   "us-east1",
-  "us-central1",
   "us-east4",
   "us-west1",
-  "us-west4",
+  "us-central1",
 ] as const;
 
 const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);

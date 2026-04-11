@@ -39,6 +39,40 @@ The gateway resolves the Vertex AI region per request with the following priorit
 curl -H "x-vertex-region: us-central1" ...
 ```
 
+## Retry + Multi-Region Fallback (Gemini DSQ)
+
+Gemini 2.5 and 3.x on Vertex AI are served through **Dynamic Shared Quota (DSQ)**, a pool that can return `429 RESOURCE_EXHAUSTED` under load even when no project-visible quota is exceeded. Google explicitly recommends exponential backoff and cross-region fallback as the mitigation. The gateway implements both transparently for any Gemini call.
+
+### Behavior
+
+- **Retries within a region** on `408`, `429`, `500`, `502`, `503`, `504`, and network errors. Up to 2 attempts per region with full-jitter exponential backoff capped at 2s.
+- **Falls back across regions** when a region stays exhausted, in this order ranked by empirical DSQ headroom (average error rate across burst 30 / 100 / 600 stress runs):
+  ```
+  global → us-east5 → us-south1 → us-west4 → us-east1 → us-east4 → us-west1 → us-central1
+  ```
+- **Honors `google.rpc.RetryInfo.retryDelay`** parsed from the error body (Vertex does not set an HTTP `Retry-After` header). Short delays are observed; when the server asks for more than 5 s the region is skipped entirely.
+- **Wall-clock budget** of 25 s bounds the entire chain so interactive calls cannot stall indefinitely.
+- **Streaming-safe**: retry only happens before the first byte of the response body is forwarded. Once a stream starts, errors surface to the client.
+- **Non-retryable errors** (4xx other than 408/429) are propagated immediately with their real upstream status, not masked as 502.
+- **Respects explicit region pinning**: when `x-vertex-region` is set by the caller, fallback is disabled so the caller gets the region they asked for.
+
+### Opting out
+
+Pass `x-vertex-region` on the request to disable cross-region fallback. The gateway will still retry within that single region but will not route anywhere else.
+
+```bash
+# Pin to us-central1 with no fallback
+curl -H "x-vertex-region: us-central1" ...
+```
+
+### Observability
+
+Successful Gemini responses include an `X-Vertex-Region-Used` header indicating which region actually served the request, so clients can see when fallback kicked in.
+
+### Scope
+
+Applies to Gemini and Gemma models only. Non-Google models (Claude, Llama, Mistral, etc.) use Vertex's OpenAPI-compat endpoint, which is not uniformly available across regions, and keep the single-shot path.
+
 ## Reasoning Effort (Thinking Control)
 
 Maps the OpenAI `reasoning_effort` parameter to Vertex AI thinking configuration, respecting per-model limits.
