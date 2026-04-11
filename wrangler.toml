@@ -1,6 +1,6 @@
 #:schema node_modules/wrangler/config-schema.json
 name = "vertex-ai-gateway"
-account_id = ""
+# account_id is read from CLOUDFLARE_ACCOUNT_ID env var
 main = "src/index.ts"
 compatibility_date = "2024-12-01"
 compatibility_flags = ["nodejs_compat"]

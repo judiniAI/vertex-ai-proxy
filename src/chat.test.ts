@@ -1,5 +1,15 @@
-import { describe, it, expect } from "vitest";
-import { mapReasoningEffort, openaiToVertex, sanitizeSchema, ensureResponseObject } from "./chat";
+import { describe, it, expect, vi } from "vitest";
+import {
+  mapReasoningEffort,
+  openaiToVertex,
+  sanitizeSchema,
+  ensureResponseObject,
+  parseRetryInfoSeconds,
+  buildRegionChain,
+  jitteredBackoffMs,
+  fetchGeminiWithFallback,
+  GEMINI_FALLBACK_REGIONS,
+} from "./chat";
 import { OpenAIChatRequest, ReasoningEffort } from "./types";
 
 // --- mapReasoningEffort ---
@@ -310,6 +320,343 @@ describe("sanitizeSchema", () => {
 });
 
 // --- ensureResponseObject ---
+
+// --- parseRetryInfoSeconds ---
+
+describe("parseRetryInfoSeconds", () => {
+  it("extracts retryDelay from google.rpc.RetryInfo detail", () => {
+    const body = JSON.stringify({
+      error: {
+        code: 429,
+        status: "RESOURCE_EXHAUSTED",
+        message: "Resource exhausted",
+        details: [
+          {
+            "@type": "type.googleapis.com/google.rpc.RetryInfo",
+            retryDelay: "17s",
+          },
+        ],
+      },
+    });
+    expect(parseRetryInfoSeconds(body)).toBe(17);
+  });
+
+  it("handles fractional seconds", () => {
+    const body = JSON.stringify({
+      error: {
+        details: [{ "@type": "google.rpc.RetryInfo", retryDelay: "2.5s" }],
+      },
+    });
+    expect(parseRetryInfoSeconds(body)).toBe(2.5);
+  });
+
+  it("handles array-wrapped error (streaming error format)", () => {
+    const body = JSON.stringify([
+      {
+        error: {
+          code: 429,
+          details: [{ "@type": "google.rpc.RetryInfo", retryDelay: "10s" }],
+        },
+      },
+    ]);
+    expect(parseRetryInfoSeconds(body)).toBe(10);
+  });
+
+  it("returns null when no RetryInfo detail present", () => {
+    const body = JSON.stringify({
+      error: {
+        code: 429,
+        message: "Resource exhausted",
+        details: [{ "@type": "google.rpc.QuotaFailure", violations: [] }],
+      },
+    });
+    expect(parseRetryInfoSeconds(body)).toBeNull();
+  });
+
+  it("returns null on non-JSON body", () => {
+    expect(parseRetryInfoSeconds("not json at all")).toBeNull();
+  });
+
+  it("returns null on empty error", () => {
+    expect(parseRetryInfoSeconds(JSON.stringify({}))).toBeNull();
+  });
+
+  it("ignores malformed retryDelay strings", () => {
+    const body = JSON.stringify({
+      error: {
+        details: [{ "@type": "google.rpc.RetryInfo", retryDelay: "soon" }],
+      },
+    });
+    expect(parseRetryInfoSeconds(body)).toBeNull();
+  });
+});
+
+// --- buildRegionChain ---
+
+describe("buildRegionChain", () => {
+  it("starts with primary then appends all fallbacks in order", () => {
+    const chain = buildRegionChain("global", false);
+    expect(chain[0]).toBe("global");
+    expect(chain.length).toBe(GEMINI_FALLBACK_REGIONS.length);
+    expect(chain).toContain("us-east5");
+    expect(chain).toContain("us-west4");
+  });
+
+  it("moves primary to front when it is not global", () => {
+    const chain = buildRegionChain("us-east5", false);
+    expect(chain[0]).toBe("us-east5");
+    expect(chain).toContain("global");
+    // No duplicates
+    expect(new Set(chain).size).toBe(chain.length);
+  });
+
+  it("returns only primary when respectExplicitRegion is true", () => {
+    const chain = buildRegionChain("us-central1", true);
+    expect(chain).toEqual(["us-central1"]);
+  });
+
+  it("handles primary not in fallback list by placing it first and keeping full list", () => {
+    const chain = buildRegionChain("europe-west1", false);
+    expect(chain[0]).toBe("europe-west1");
+    expect(chain.length).toBe(GEMINI_FALLBACK_REGIONS.length + 1);
+  });
+});
+
+// --- jitteredBackoffMs ---
+
+describe("jitteredBackoffMs", () => {
+  it("returns non-negative values", () => {
+    for (let i = 0; i < 100; i++) {
+      expect(jitteredBackoffMs(0)).toBeGreaterThanOrEqual(0);
+    }
+  });
+
+  it("stays within the exponential cap", () => {
+    for (let i = 0; i < 100; i++) {
+      expect(jitteredBackoffMs(0)).toBeLessThanOrEqual(250);
+      expect(jitteredBackoffMs(1)).toBeLessThanOrEqual(500);
+      expect(jitteredBackoffMs(2)).toBeLessThanOrEqual(1000);
+    }
+  });
+
+  it("caps at MAX_BACKOFF_MS regardless of high attempt numbers", () => {
+    for (let i = 0; i < 100; i++) {
+      expect(jitteredBackoffMs(10)).toBeLessThanOrEqual(2000);
+    }
+  });
+});
+
+// --- fetchGeminiWithFallback ---
+
+describe("fetchGeminiWithFallback", () => {
+  function mockResponse(status: number, body: unknown): Response {
+    return new Response(typeof body === "string" ? body : JSON.stringify(body), {
+      status,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  const baseOpts = {
+    projectId: "test-project",
+    model: "gemini-2.5-flash",
+    token: "fake-token",
+    requestBody: JSON.stringify({ contents: [] }),
+    primaryRegion: "global",
+    stream: false,
+    respectExplicitRegion: false,
+  };
+
+  it("returns success on first attempt without touching fallback", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(mockResponse(200, { ok: true }));
+    const result = await fetchGeminiWithFallback(baseOpts, fetchImpl as unknown as typeof fetch);
+
+    expect(result.succeeded).toBe(true);
+    expect(result.regionUsed).toBe("global");
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(result.attemptLog).toEqual(["global#0:ok"]);
+  });
+
+  it("retries on 429 within region then succeeds on second attempt", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(
+        mockResponse(429, {
+          error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "Resource exhausted" },
+        })
+      )
+      .mockResolvedValueOnce(mockResponse(200, { ok: true }));
+
+    const result = await fetchGeminiWithFallback(baseOpts, fetchImpl as unknown as typeof fetch);
+
+    expect(result.succeeded).toBe(true);
+    expect(result.regionUsed).toBe("global");
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(result.attemptLog).toEqual(["global#0:429", "global#1:ok"]);
+  });
+
+  it("falls back to next region when primary is exhausted after retries", async () => {
+    const errBody = {
+      error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "Resource exhausted" },
+    };
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(mockResponse(429, errBody))
+      .mockResolvedValueOnce(mockResponse(429, errBody))
+      .mockResolvedValueOnce(mockResponse(200, { ok: true }));
+
+    const result = await fetchGeminiWithFallback(baseOpts, fetchImpl as unknown as typeof fetch);
+
+    expect(result.succeeded).toBe(true);
+    expect(result.regionUsed).toBe("us-east5"); // next after global
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+    expect(result.attemptLog).toEqual([
+      "global#0:429",
+      "global#1:429",
+      "us-east5#0:ok",
+    ]);
+  });
+
+  it("skips region immediately when RetryInfo.retryDelay exceeds threshold", async () => {
+    const longDelayErr = {
+      error: {
+        code: 429,
+        message: "Resource exhausted",
+        details: [{ "@type": "google.rpc.RetryInfo", retryDelay: "60s" }],
+      },
+    };
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(mockResponse(429, longDelayErr))
+      .mockResolvedValueOnce(mockResponse(200, { ok: true }));
+
+    const result = await fetchGeminiWithFallback(baseOpts, fetchImpl as unknown as typeof fetch);
+
+    expect(result.succeeded).toBe(true);
+    expect(result.regionUsed).toBe("us-east5");
+    // Should have exactly 2 calls: global (skipped early) + us-east5
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(result.attemptLog).toContain("global:retryAfter=60s,skip-region");
+  });
+
+  it("propagates non-retryable 400 immediately without fallback", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(
+        mockResponse(400, {
+          error: { code: 400, status: "INVALID_ARGUMENT", message: "Bad schema" },
+        })
+      );
+
+    const result = await fetchGeminiWithFallback(baseOpts, fetchImpl as unknown as typeof fetch);
+
+    expect(result.succeeded).toBe(false);
+    expect(result.response.status).toBe(400);
+    expect(result.regionUsed).toBe("global");
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("propagates 401 immediately (auth failure is not retryable)", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(mockResponse(401, { error: { code: 401, message: "Unauthorized" } }));
+    const result = await fetchGeminiWithFallback(baseOpts, fetchImpl as unknown as typeof fetch);
+
+    expect(result.succeeded).toBe(false);
+    expect(result.response.status).toBe(401);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns final 429 with real status when all regions exhausted", async () => {
+    const errBody = {
+      error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "Resource exhausted" },
+    };
+    // Factory ensures every call returns a FRESH Response (body is single-read)
+    const fetchImpl = vi.fn().mockImplementation(async () => mockResponse(429, errBody));
+
+    const result = await fetchGeminiWithFallback(baseOpts, fetchImpl as unknown as typeof fetch);
+
+    expect(result.succeeded).toBe(false);
+    expect(result.response.status).toBe(429);
+    expect(result.regionUsed).toBe("none");
+    // 8 regions × 2 attempts each = 16 calls
+    expect(fetchImpl).toHaveBeenCalledTimes(16);
+  });
+
+  it("does not fall back when respectExplicitRegion is true", async () => {
+    const errBody = {
+      error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "Resource exhausted" },
+    };
+    const fetchImpl = vi.fn().mockImplementation(async () => mockResponse(429, errBody));
+
+    const result = await fetchGeminiWithFallback(
+      { ...baseOpts, primaryRegion: "us-central1", respectExplicitRegion: true },
+      fetchImpl as unknown as typeof fetch
+    );
+
+    expect(result.succeeded).toBe(false);
+    expect(result.response.status).toBe(429);
+    // Only 2 attempts in us-central1, no fallback to other regions
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries on 503 and 504 (transient upstream failures)", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(mockResponse(503, { error: { code: 503 } }))
+      .mockResolvedValueOnce(mockResponse(200, { ok: true }));
+
+    const result = await fetchGeminiWithFallback(baseOpts, fetchImpl as unknown as typeof fetch);
+
+    expect(result.succeeded).toBe(true);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("treats network errors as retryable and falls back to next attempt", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("ECONNRESET"))
+      .mockResolvedValueOnce(mockResponse(200, { ok: true }));
+
+    const result = await fetchGeminiWithFallback(baseOpts, fetchImpl as unknown as typeof fetch);
+
+    expect(result.succeeded).toBe(true);
+    expect(result.attemptLog[0]).toContain("network:ECONNRESET");
+  });
+
+  it("builds correct URL for global endpoint (no region prefix)", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(mockResponse(200, { ok: true }));
+    await fetchGeminiWithFallback(baseOpts, fetchImpl as unknown as typeof fetch);
+
+    const calledUrl = (fetchImpl.mock.calls[0][0] as string);
+    expect(calledUrl).toContain("https://aiplatform.googleapis.com");
+    expect(calledUrl).toContain("/locations/global/");
+    expect(calledUrl).toContain(":generateContent");
+    expect(calledUrl).not.toContain("global-aiplatform");
+  });
+
+  it("builds correct URL for regional endpoint", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(mockResponse(200, { ok: true }));
+    await fetchGeminiWithFallback(
+      { ...baseOpts, primaryRegion: "us-east5" },
+      fetchImpl as unknown as typeof fetch
+    );
+
+    const calledUrl = fetchImpl.mock.calls[0][0] as string;
+    expect(calledUrl).toContain("https://us-east5-aiplatform.googleapis.com");
+    expect(calledUrl).toContain("/locations/us-east5/");
+  });
+
+  it("uses streamGenerateContent URL when stream=true", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(mockResponse(200, "data: [DONE]\n\n"));
+    await fetchGeminiWithFallback(
+      { ...baseOpts, stream: true },
+      fetchImpl as unknown as typeof fetch
+    );
+
+    const calledUrl = fetchImpl.mock.calls[0][0] as string;
+    expect(calledUrl).toContain(":streamGenerateContent?alt=sse");
+  });
+});
 
 describe("ensureResponseObject", () => {
   it("returns object as-is", () => {
