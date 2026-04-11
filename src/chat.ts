@@ -463,32 +463,30 @@ export async function handleChatCompletions(
     );
   }
 
-  const successHeaders: Record<string, string> = { "X-Vertex-Region-Used": regionUsed };
+  // Log the region actually used (and fallback trail if any) for operator
+  // observability via wrangler tail / Logpush. Not exposed to clients —
+  // the gateway is meant to be an opaque abstraction over Vertex.
+  if (isGoogle && attemptLog.length > 0) {
+    console.log(
+      JSON.stringify({
+        evt: "gemini_request",
+        model,
+        region: regionUsed,
+        attempts: attemptLog.length,
+        trail: attemptLog,
+      })
+    );
+  }
 
   if (isGoogle) {
-    if (body.stream) return handleGeminiStream(response, model, successHeaders);
+    if (body.stream) return handleGeminiStream(response, model);
     const vertexData = (await response.json()) as VertexResponse;
-    return jsonWithHeaders(vertexToOpenai(vertexData, model), 200, successHeaders);
+    return json(vertexToOpenai(vertexData, model));
   } else {
     if (body.stream) return passthroughStream(response);
     const data = (await response.json()) as OpenAIChatResponse;
     return json(data);
   }
-}
-
-function jsonWithHeaders(
-  data: unknown,
-  status: number,
-  extraHeaders: Record<string, string>
-): Response {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: {
-      "Content-Type": "application/json",
-      "Access-Control-Allow-Origin": "*",
-      ...extraHeaders,
-    },
-  });
 }
 
 // --- OpenAI <-> Vertex format conversion ---
@@ -616,11 +614,7 @@ function vertexToOpenai(data: VertexResponse, model: string): OpenAIChatResponse
 
 // --- Streaming ---
 
-function handleGeminiStream(
-  response: Response,
-  model: string,
-  extraHeaders: Record<string, string> = {}
-): Response {
+function handleGeminiStream(response: Response, model: string): Response {
   const id = `chatcmpl-${crypto.randomUUID()}`;
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
@@ -696,7 +690,6 @@ function handleGeminiStream(
       "Cache-Control": "no-cache",
       Connection: "keep-alive",
       "Access-Control-Allow-Origin": "*",
-      ...extraHeaders,
     },
   });
 }
