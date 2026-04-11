@@ -74,7 +74,6 @@ async function callOnce(apiKey, model, counter) {
       }),
     });
     const latencyMs = Date.now() - t0;
-    const regionUsed = res.headers.get("x-vertex-region-used") ?? "?";
     let errMsg = "";
     if (!res.ok) {
       try {
@@ -86,12 +85,11 @@ async function callOnce(apiKey, model, counter) {
     } else {
       await res.json().catch(() => null);
     }
-    return { status: res.status, latencyMs, regionUsed, errMsg };
+    return { status: res.status, latencyMs, errMsg };
   } catch (err) {
     return {
       status: 0,
       latencyMs: Date.now() - t0,
-      regionUsed: "?",
       errMsg: err.message,
     };
   } finally {
@@ -149,11 +147,6 @@ async function main() {
   const r429 = results.filter((r) => r.status === 429);
   const other = results.filter((r) => r.status !== 200 && r.status !== 429);
 
-  const byRegion = results.reduce((acc, r) => {
-    if (r.status === 200) acc[r.regionUsed] = (acc[r.regionUsed] ?? 0) + 1;
-    return acc;
-  }, {});
-
   const latencies = ok.map((r) => r.latencyMs).sort((a, b) => a - b);
   const pct = (p) => latencies[Math.min(latencies.length - 1, Math.floor(latencies.length * p))] ?? 0;
   const mean = latencies.length ? Math.round(latencies.reduce((s, x) => s + x, 0) / latencies.length) : 0;
@@ -171,10 +164,7 @@ async function main() {
   console.log(`Other errors:       ${other.length}  (${((other.length / targetTotal) * 100).toFixed(1)}%)`);
   console.log(`\nLatency (successful only):`);
   console.log(`  mean=${mean}ms  p50=${pct(0.5)}ms  p95=${pct(0.95)}ms  p99=${pct(0.99)}ms`);
-  console.log(`\nSuccess by region:`);
-  for (const [r, n] of Object.entries(byRegion).sort((a, b) => b[1] - a[1])) {
-    console.log(`  ${r.padEnd(14)} ${n}  (${((n / ok.length) * 100).toFixed(1)}%)`);
-  }
+  console.log(`\n(region distribution of successes is server-side only — run 'wrangler tail' in parallel)`);
   if (r429.length > 0) {
     console.log(`\n429 samples (first 3):`);
     for (const r of r429.slice(0, 3)) console.log(`  ${r.errMsg}`);

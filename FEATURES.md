@@ -67,7 +67,7 @@ curl -H "x-vertex-region: us-central1" ...
 
 ### Observability
 
-Successful Gemini responses include an `X-Vertex-Region-Used` header indicating which region actually served the request, so clients can see when fallback kicked in.
+The gateway is opaque to clients: responses do not expose which region served them. For operators, every Gemini request emits a structured log line via `console.log` with the model, final region, attempt count, and full fallback trail, visible via `wrangler tail` or Cloudflare Logpush.
 
 ### Scope
 

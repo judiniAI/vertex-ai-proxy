@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 /**
  * End-to-end burst test against the local gateway (wrangler dev) to verify
- * retry+fallback behavior. Fires N concurrent requests, reports per-request
- * status and X-Vertex-Region-Used header so we can see the fallback chain
- * absorbing DSQ 429s.
+ * retry+fallback behavior. Fires N concurrent requests and reports success
+ * rate, 429 count, and latency percentiles. The gateway is opaque to clients
+ * so the region used per request is not visible here — use `wrangler tail`
+ * while running this to see the per-request fallback trail in server logs.
  *
  * Usage:
  *   node scripts/burst-gateway.mjs              # burst 30
@@ -58,7 +59,6 @@ async function callOnce(apiKey) {
       }),
     });
     const latencyMs = Date.now() - t0;
-    const regionUsed = res.headers.get("x-vertex-region-used") ?? "?";
     let errMsg = "";
     if (!res.ok) {
       try {
@@ -70,9 +70,9 @@ async function callOnce(apiKey) {
     } else {
       await res.json().catch(() => null);
     }
-    return { status: res.status, latencyMs, regionUsed, errMsg };
+    return { status: res.status, latencyMs, errMsg };
   } catch (err) {
-    return { status: 0, latencyMs: Date.now() - t0, regionUsed: "?", errMsg: err.message };
+    return { status: 0, latencyMs: Date.now() - t0, errMsg: err.message };
   }
 }
 
@@ -96,11 +96,6 @@ async function main() {
   const r429 = results.filter((r) => r.status === 429);
   const other = results.filter((r) => r.status !== 200 && r.status !== 429);
 
-  const byRegion = results.reduce((acc, r) => {
-    if (r.status === 200) acc[r.regionUsed] = (acc[r.regionUsed] ?? 0) + 1;
-    return acc;
-  }, {});
-
   const latencies = ok.map((r) => r.latencyMs).sort((a, b) => a - b);
   const p50 = latencies[Math.floor(latencies.length * 0.5)] ?? 0;
   const p95 = latencies[Math.floor(latencies.length * 0.95)] ?? 0;
@@ -108,7 +103,7 @@ async function main() {
 
   console.log(`\nResults: sent=${burst}  ok=${ok.length}  429=${r429.length}  other=${other.length}  wall=${wallMs}ms`);
   console.log(`Latency:  p50=${p50}ms  p95=${p95}ms  p99=${p99}ms`);
-  console.log(`Success by region: ${JSON.stringify(byRegion)}`);
+  console.log(`(region distribution of successes is now server-side — run 'wrangler tail' in parallel)`);
   if (other.length > 0) {
     console.log(`\nOther errors (first 3):`);
     for (const r of other.slice(0, 3)) {
